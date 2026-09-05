@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>docqa-rag &mdash; policy assistant</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 15px/1.5 system-ui, sans-serif; max-width: 860px; margin: 0 auto; padding: 24px; }
+    #chat { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
+    .msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; white-space: pre-wrap; }
+    .user { align-self: flex-end; background: #2563eb; color: #fff; }
+    .bot { align-self: flex-start; background: #1f2937; color: #fff; }
+    .sources { font-size: 12px; color: #9ca3af; margin-top: 6px; }
+    form { display: flex; gap: 8px; }
+    input { flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #4b5563; background: #111827; color: #fff; }
+    button { padding: 10px 18px; border-radius: 8px; border: 0; background: #2563eb; color: #fff; cursor: pointer; }
+    .status { font-size: 12px; color: #6b7280; }
+  </style>
+</head>
+<body>
+  <h1>docqa-rag &mdash; policy assistant</h1>
+  <p class="status">LangGraph pipeline: rewrite &rarr; hybrid retrieve (pgvector + FTS) &rarr; rerank &rarr; generate with citations</p>
+  <div id="chat"></div>
+  <form id="ask-form">
+    <input id="q" placeholder="Ask about the documents..." autocomplete="off" required />
+    <button type="submit">Ask</button>
+  </form>
+
+  <script>
+    const chat = document.getElementById('chat');
+
+    function addMsg(role, text) {
+      const d = document.createElement('div');
+      d.className = 'msg ' + role;
+      d.textContent = text;
+      chat.appendChild(d);
+      chat.scrollTop = chat.scrollHeight;
+      return d;
+    }
+
+    function addSources(sources) {
+      if (!sources.length) return;
+      const el = document.createElement('div');
+      el.className = 'sources';
+      el.textContent = 'Sources: ' + sources.map(s => `[${s.rank}] ${s.source} (chunk ${s.chunk_index})`).join(', ');
+      chat.appendChild(el);
+    }
+
+    document.getElementById('ask-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const q = document.getElementById('q').value;
+      if (!q.trim()) return;
+      addMsg('user', q);
+      const answerEl = addMsg('bot', '\u2026');
+      document.getElementById('q').value = '';
+
+      const res = await fetch('/ask/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: q }),
+      });
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split('\n\n');
+        buf = parts.pop();
+        for (const chunk of parts.filter(Boolean)) {
+          const line = chunk.split('\n').find(l => l.startsWith('data: '));
+          if (!line) continue;
+          const evt = JSON.parse(line.slice(6));
+          if (evt.answer) answerEl.textContent = evt.answer;
+          else if (evt.answer === '') /* placeholder */ ;
+          else if (evt.sources) addSources(evt.sources);
+        }
+      }
+    });
+  </script>
+</body>
+</html>
