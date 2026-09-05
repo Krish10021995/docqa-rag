@@ -11,7 +11,6 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 COPY src ./src
 COPY data ./data
-COPY checkpoints ./checkpoints
 
 ENV PYTHONUNBUFFERED=1
 ENV DOCQA_DATABASE_URL="postgresql+psycopg://postgres:postgres@db:5432/docqa"

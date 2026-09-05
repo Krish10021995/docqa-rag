@@ -3,10 +3,21 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from langchain_core.documents import Document
 from langchain_postgres import PGVector
 from sqlalchemy import create_engine, text
+
+# langchain-postgres 0.0.17 schema: a shared `langchain_pg_embedding` rowset
+# (column `document` + jsonb `cmetadata`) keyed to `langchain_pg_collection`
+# by `collection_id`. We join on the collection name so FTS and count queries
+# deliberately stay independent of the ORM-defined table-per-dim classes.
+_COLLECTION_JOIN = """
+FROM langchain_pg_embedding AS e
+JOIN langchain_pg_collection AS c ON c.uuid = e.collection_id
+WHERE c.name = :coll
+"""
 
 
 @dataclass
@@ -28,6 +39,7 @@ class HybridStore:
     ) -> None:
         self.conn_str = database_url
         self.collection = collection_name
+        self.chunk_id_key = chunk_id_key
         self.engine = create_engine(database_url, pool_pre_ping=True)
         self.store = PGVector(
             embeddings=embeddings,
@@ -38,22 +50,32 @@ class HybridStore:
 
     def reset(self) -> None:
         with self.engine.begin() as conn:
-            conn.execute(text(f'DELETE FROM "{self.collection}"'))
+            conn.execute(
+                text(
+                    """
+                    DELETE FROM langchain_pg_embedding AS e
+                    USING langchain_pg_collection AS c
+                    WHERE e.collection_id = c.uuid AND c.name = :coll
+                    """
+                ),
+                {"coll": self.collection},
+            )
 
     def add_documents(self, docs: Sequence[Document]) -> list[str]:
         keyed = []
         for d in docs:
-            meta = dict(d.metadata or {})
+            meta: dict[str, Any] = dict(d.metadata or {})
             chunk_id = hashlib.sha1(
                 f"{meta.get('source', '')}:{meta.get('chunk_index', 0)}".encode()
             ).hexdigest()[:16]
-            meta["chunk_id"] = chunk_id
+            meta[self.chunk_id_key] = chunk_id
             keyed.append(Document(page_content=d.page_content, metadata=meta))
         return self.store.add_documents(keyed)
 
     def count(self) -> int:
         with self.engine.connect() as conn:
-            return int(conn.execute(text(f'SELECT count(*) FROM "{self.collection}"')).scalar_one())
+            sql = text(f"SELECT count(*) {_COLLECTION_JOIN}")
+            return int(conn.execute(sql, {"coll": self.collection}).scalar_one())
 
     def _vector_hits(self, question: str, k: int) -> list[tuple[Document, float]]:
         if k <= 0:
@@ -69,18 +91,20 @@ class HybridStore:
             return []
         sql = text(
             f"""
-            SELECT content, metadata
-            FROM "{self.collection}"
-            WHERE to_tsvector('english', content) @@ websearch_to_tsquery('english', :q)
+            SELECT e.document AS content, e.cmetadata AS metadata
+            {_COLLECTION_JOIN}
+            AND to_tsvector('english', e.document) @@ websearch_to_tsquery('english', :q)
             ORDER BY ts_rank_cd(
-                to_tsvector('english', content),
+                to_tsvector('english', e.document),
                 websearch_to_tsquery('english', :q)
             ) DESC
             LIMIT :k
             """
         )
         with self.engine.connect() as conn:
-            rows = conn.execute(sql, {"q": question, "k": k}).mappings().all()
+            rows = (
+                conn.execute(sql, {"coll": self.collection, "q": question, "k": k}).mappings().all()
+            )
         return [
             (
                 Document(page_content=r["content"], metadata=r["metadata"]),
